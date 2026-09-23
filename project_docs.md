@@ -361,34 +361,276 @@
 
 ---
 
-## 4. API Specification (Основные эндпоинты)
+## 4. API Specification
 
-### Auth & Pair
-*   `POST /auth/register` — Регистрация.
-*   `POST /auth/login` — Вход.
-*   `POST /pair/invite` — Генерация кода приглашения.
-*   `POST /pair/accept` — Принятие приглашения (код).
+**Общие стандарты:**
+- **Base URL:** `https://api.coupleplan.app/v1`
+- **Auth:** Header `Authorization: Bearer <access_token>`
+- **Content-Type:** `application/json`
+- **Дата/Время:** ISO 8601 (`YYYY-MM-DDTHH:mm:ssZ`)
+- **Пагинация:** Cursor-based (`?limit=20&cursor=xyz`)
+- **Ответы:**
+  - Успех: `200 OK` / `201 Created` с JSON body.
+  - Ошибка: `4xx` / `5xx` с телом `{ "error": { "code": "ERROR_CODE", "message": "Читаемое сообщение", "details": {} } }`.
 
-### Common Data
-*   `GET /sync` — Полная синхронизация данных пары (получение всех сущностей).
-*   `WS /ws` — WebSocket канал для realtime обновлений.
+---
 
-### Trips & Checklists
-*   `POST /trips` — Создание поездки.
-*   `POST /trips/{id}/checklist` — Добавление чек-листа.
-*   `POST /templates/apply` — Применение шаблона к чек-листу.
-*   `PATCH /checklist/items/{id}` — Обновление статуса элемента.
+### 4.1. Auth & Pair (Аутентификация и Пара)
 
-### Surprises
-*   `POST /surprises` — Создание сюрприза.
-    *   *Body:* `{ recipient_id, content, reveal_at }`
-*   `GET /surprises` — Список сюрпризов (для получателя: без поля `content`, если `reveal_at > now`).
-*   `GET /surprises/{id}` — Детали (бэкенд проверяет время и возвращает контент или заглушку).
+#### `POST /auth/register`
+Регистрация нового пользователя.
+- **Request Body:**
+  ```json
+  {
+    "email": "user@example.com",
+    "password": "SecurePass123!",
+    "display_name": "Alex"
+  }
+  ```
+- **Response (201 Created):**
+  ```json
+  {
+    "user_id": "usr_abc123",
+    "access_token": "eyJ...",
+    "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..."
+  }
+  ```
+- **Errors:** `400 Bad Request` (слабый пароль), `409 Conflict` (email занят).
 
-### Templates
-*   `GET /templates` — Список доступных системных шаблонов.
-*   `POST /templates/suggest` — Отправка идеи шаблона админу.
-*   `POST /checklists/{id}/save-as-template` — Сохранение своего списка (локально/в пару).
+#### `POST /auth/login`
+Вход в аккаунт.
+- **Request Body:** `{ "email": "...", "password": "..." }`
+- **Response (200 OK):** `{ "user_id": "...", "access_token": "...", "refresh_token": "..." }`
+- **Errors:** `401 Unauthorized` (неверные данные).
+
+#### `POST /auth/refresh`
+Обновление access токена.
+- **Request Body:** `{ "refresh_token": "..." }`
+- **Response (200 OK):** `{ "access_token": "..." }`
+- **Errors:** `401 Unauthorized` (токен истек или отозван).
+
+#### `POST /pair/invite`
+Генерация кода приглашения для партнера.
+- **Headers:** `Authorization: Bearer ...`
+- **Response (200 OK):**
+  ```json
+  {
+    "invite_code": "COUPLE-XY7Z",
+    "expires_at": "2024-12-31T23:59:59Z" // Код действует 24 часа
+  }
+  ```
+- **Errors:** `409 Conflict` (пользователь уже в паре).
+
+#### `POST /pair/accept`
+Принятие приглашения.
+- **Request Body:** `{ "invite_code": "COUPLE-XY7Z" }`
+- **Headers:** `Authorization: Bearer ...`
+- **Response (200 OK):** `{ "pair_id": "pair_123", "partner_user_id": "usr_def456" }`
+- **Errors:** `404 Not Found` (код не найден), `410 Gone` (код истек), `409 Conflict` (уже в паре).
+
+#### `GET /pair/status`
+Проверка статуса пары текущего пользователя.
+- **Response (200 OK):**
+  ```json
+  {
+    "has_pair": true,
+    "pair_id": "pair_123",
+    "partner_user_id": "usr_def456",
+    "partner_display_name": "Maria"
+  }
+  ```
+  *Если пары нет:* `{ "has_pair": false }`
+
+---
+
+### 4.2. Common Data (Синхронизация)
+
+#### `GET /sync`
+Полная синхронизация данных пары (получение всех сущностей с момента последней синхронизации).
+- **Query Params:** `?since=<timestamp>` (опционально, для инкрементальной синхронизации).
+- **Response (200 OK):**
+  ```json
+  {
+    "server_time": "2024-12-01T12:00:00Z",
+    "trips": [ ... ], // Массив объектов Trip
+    "checklists": [ ... ],
+    "surprises": [ ... ], // Сюрпризы, где current_user = recipient
+    "templates": [ ... ] // Обновленные системные шаблоны
+  }
+  ```
+
+#### `WS /ws`
+WebSocket канал для realtime обновлений.
+- **Events:** `trip.updated`, `checklist.item_toggled`, `surprise.revealed`, `pair.dissolved`.
+
+---
+
+### 4.3. Trips & Checklists (Поездки и Списки)
+
+#### `POST /trips`
+Создание поездки.
+- **Request Body:**
+  ```json
+  {
+    "title": "Отпуск в Италии",
+    "start_date": "2025-06-01",
+    "end_date": "2025-06-14",
+    "destination": "Rome, Italy" // Опционально
+  }
+  ```
+- **Response (201 Created):** Объект `Trip` с `id`, `created_at`, `updated_at`.
+
+#### `GET /trips`
+Список поездок (активных и будущих).
+- **Response (200 OK):** `[ { "id": "trip_1", "title": "...", ... } ]`
+
+#### `PATCH /trips/{id}`
+Обновление поездки.
+- **Request Body:** Любые поля из `POST /trips` (частичное обновление).
+
+#### `DELETE /trips/{id}`
+Удаление поездки (мягкое удаление на сервере).
+- **Response:** `204 No Content`.
+
+#### `POST /trips/{id}/checklist`
+Создание чек-листа для поездки (или общего списка).
+- **Request Body:**
+  ```json
+  {
+    "title": "Что взять с собой",
+    "items": [ // Опционально начальные элементы
+      { "text": "Паспорта", "is_checked": false },
+      { "text": "Билеты", "is_checked": false }
+    ]
+  }
+  ```
+- **Response (201 Created):** Объект `Checklist` с вложенными `items`.
+
+#### `PATCH /checklists/{id}`
+Обновление метаданных чек-листа (заголовок).
+
+#### `PATCH /checklists/{id}/items/{item_id}`
+Обновление элемента чек-листа.
+- **Request Body:**
+  ```json
+  { "is_checked": true } 
+  // ИЛИ { "text": "Новый текст" } 
+  // ИЛИ { "position": 5 } // Для изменения порядка
+  ```
+
+#### `DELETE /checklists/{id}/items/{item_id}`
+Удаление элемента.
+
+#### `POST /templates/apply`
+Применение системного шаблона к существующему чек-листу (добавляет элементы).
+- **Request Body:** `{ "checklist_id": "chk_123", "template_id": "tmpl_packing_basic" }`
+- **Response (200 OK):** Обновленный объект `Checklist`.
+
+---
+
+### 4.4. Surprises (Сюрпризы)
+
+#### `POST /surprises`
+Создание сюрприза.
+- **Request Body:**
+  ```json
+  {
+    "recipient_id": "usr_def456",
+    "content": "Сертификат на спа-процедуры...",
+    "reveal_at": "2024-12-25T09:00:00Z",
+    "trip_id": "trip_123" // Опционально, привязка к поездке
+  }
+  ```
+- **Logic:** Бэкенд **никогда** не возвращает `content` в ответе создателю после создания. Получателю `content` возвращается только если `now >= reveal_at`.
+- **Response (201 Created):**
+  ```json
+  {
+    "id": "surp_xyz",
+    "creator_id": "usr_abc123",
+    "recipient_id": "usr_def456",
+    "reveal_at": "2024-12-25T09:00:00Z",
+    "content": null, // Всегда null в ответе
+    "status": "pending"
+  }
+  ```
+
+#### `GET /surprises`
+Список сюрпризов для текущего пользователя (как получателя).
+- **Response (200 OK):**
+  ```json
+  [
+    {
+      "id": "surp_xyz",
+      "creator_display_name": "Alex",
+      "reveal_at": "2024-12-25T09:00:00Z",
+      "content": null, // Если now < reveal_at
+      "status": "pending" // или "revealed"
+    }
+  ]
+  ```
+
+#### `GET /surprises/{id}`
+Детали сюрприза.
+- **Logic:** Если `now < reveal_at`, поле `content` = `null`.
+- **Response (200 OK):** `{ "id": "...", "content": "Сертификат...", "status": "revealed" }` (если время пришло).
+- **Errors:** `403 Forbidden` (если текущий пользователь не является получателем).
+
+---
+
+### 4.5. Templates (Шаблоны)
+
+#### `GET /templates`
+Список доступных системных шаблонов.
+- **Query Params:** `?category=packing` (опционально).
+- **Response (200 OK):**
+  ```json
+  [
+    {
+      "id": "tmpl_packing_basic",
+      "title": "Базовый сборы",
+      "category": "packing",
+      "items_count": 15,
+      "is_system": true
+    }
+  ]
+  ```
+
+#### `POST /templates/suggest`
+Отправка идеи нового шаблона администраторам.
+- **Request Body:**
+  ```json
+  {
+    "category": "dating",
+    "title": "Идеи для свидания дома",
+    "description": "Список идей: настолки, кино, готовим вместе..."
+  }
+  ```
+- **Response (202 Accepted):** `{ "status": "submitted" }`
+
+#### `POST /checklists/{id}/save-as-template`
+Сохранение пользовательского чек-листа как шаблон (для пары или системы).
+- **Request Body:** `{ "title": "Мои идеальные сборы", "scope": "pair" }` // `pair` или `system` (на модерацию)
+- **Response (201 Created):** Объект шаблона.
+
+---
+
+### Missing Endpoints Check (Проверка на полноту)
+
+На основе User Stories и функциональных требований, **не хватает следующих эндпоинтов**:
+
+1.  **User Profile:**
+    *   `GET /users/me` — Получение профиля текущего пользователя (для экрана настроек).
+    *   `PATCH /users/me` — Обновление имени, аватара.
+2.  **Account Management:**
+    *   `POST /auth/logout` — Отзыв токенов (логический выход).
+    *   `DELETE /users/me` — Удаление аккаунта (требование сторов).
+    *   `POST /pair/dissolve` — Разрыв связи с партнером.
+3.  **Notifications (для будущей реализации пушей):**
+    *   `POST /devices/register` — Регистрация device token для push-уведомлений.
+4.  **Calendar Export:**
+    *   `GET /trips/{id}/calendar.ics` — Экспорт поездки в формате iCal (для US-07).
+
+Эти эндпоинты будут добавлены по мере необходимости (Profile/Logout — обязательно для MVP, остальные — по приоритету).
 
 ---
 
